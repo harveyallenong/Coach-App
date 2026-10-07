@@ -29,6 +29,8 @@ pnpm test:int       # src/**/*.int.test.ts (needs coachbook_test DB)
 pnpm test:e2e       # Playwright
 ```
 Local services: Mailpit UI http://localhost:8025, MinIO console http://localhost:9001.
+`pnpm typecheck` runs `next typegen` first (generates the global `PageProps`/`LayoutProps` types).
+shadcn components: `pnpm dlx shadcn add <name>` (if the registry is unreachable, copy the upstream source into `src/components/ui/`).
 
 ## Layout (short)
 - `src/app/` routes only: `(public)`, `(auth)`, `coach/`, `me/` (client), `admin/`, `api/`.
@@ -64,7 +66,8 @@ Local services: Mailpit UI http://localhost:8025, MinIO console http://localhost
 - Write server actions through the `action({ input, rateLimit, handler })` wrapper. Return `Result<T, AppError>` and don't throw to the client.
 
 **Data integrity**
-- The DB prevents double-booking: an exclusion constraint on `appointment(coach_id, occupied)` where `status = 'SCHEDULED'`. Don't replace it with app-only checks. Map SQLSTATE `23P01` to `SlotTaken`.
+- The DB prevents double-booking: the exclusion constraint `Appointment_no_overlap` on `("coachId", tstzrange("occupiedStart", "occupiedEnd"))` where `status = 'SCHEDULED'`. Always write `occupiedStart/End` = start/end ± buffers (a CHECK enforces it). Don't replace it with app-only checks. Map SQLSTATE `23P01` to `SlotTaken`.
+- Every Prisma `DateTime` is `@db.Timestamptz(3)`.
 - Group capacity is checked under `SELECT … FOR UPDATE` on the appointment row.
 - Changes that move money or credits are idempotent through unique `idempotencyKey` / `dedupeKey` columns.
 - Webhooks: verify the signature first, then dedupe on `WebhookEvent(provider, eventId)`.
@@ -76,6 +79,16 @@ Local services: Mailpit UI http://localhost:8025, MinIO console http://localhost
 **Providers**
 - Business logic depends only on provider interfaces and normalized events. Adding a provider (for example PayMongo) must not touch services or domain code.
 - Tests use `fake` adapters.
+
+**Next.js 16 specifics**
+- Read `node_modules/next/dist/docs/` before using an unfamiliar API — this version differs from older training data.
+- Cache Components is on: anything that reads the session/cookies/params must render inside a `<Suspense>` boundary. Authenticated layouts already wrap their shell in one; pages under them can just `await` queries.
+- Route protection: `src/proxy.ts` (formerly middleware) is only an optimistic cookie check. Real checks happen in pages (`requirePageActor`) and services.
+- Use `refresh()` from `next/cache` in server actions to refresh the current route after a mutation.
+
+**Forms**
+- react-hook-form + `zodResolver(schema)`. Use `registerWithDefault` so saved values are in the server HTML. Wrap fields in `<fieldset disabled={!hydrated}>` (`useHydrated`).
+- Show server errors with `applyActionError(result, form.setError)`.
 
 **Code style**
 - TypeScript strict. Avoid `any` and non-null `!` unless a comment explains why.

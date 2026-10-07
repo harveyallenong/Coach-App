@@ -1,6 +1,6 @@
 # CoachBook — Implementation Plan
 
-Status: **APPROVED with amendments** (Step 0.1, revision 2)
+Status: **APPROVED with amendments** (revision 3 — Phase 1 implementation notes added)
 Last updated: 2026-10-07
 
 This plan turns the product brief into an architecture, a data model, a folder layout and a phased task list. Section 9 records the **decisions approved by the product owner**; each also has an ADR in `docs/decisions/`. The one change to a brief-level Project Decision (payments: direct-to-coach instead of Stripe as the default provider) was made explicitly by the product owner — see ADR 0005.
@@ -79,15 +79,16 @@ flowchart LR
 ### 1.3 How double-booking is prevented (DB level)
 We split "time the coach is occupied" from "who is attending":
 
-* **`Appointment`** — one row per occupied coach time slot (1:1 session or a group class). Columns `start_at`, `end_at`, `buffer_before_min`, `buffer_after_min`, plus a **generated** column
-  `occupied tstzrange GENERATED ALWAYS AS (tstzrange(start_at - buffer_before, end_at + buffer_after, '[)')) STORED`.
-* Raw-SQL migration:
+* **`Appointment`** — one row per occupied coach time slot (1:1 session or a group class). Columns `startAt`, `endAt`, `bufferBeforeMin`, `bufferAfterMin`, plus explicit `occupiedStart = startAt − bufferBefore` and `occupiedEnd = endAt + bufferAfter`, kept honest by a `CHECK` constraint.
+  *Implementation note (Phase 1):* the original idea of a `GENERATED` `tstzrange` column doesn't work — `timestamptz ± interval` is not `IMMUTABLE`, which Postgres requires for generated columns and index expressions. Explicit columns + CHECK give the same guarantee.
+* Raw-SQL migration (`prisma/migrations/*_booking_integrity`):
   ```sql
   CREATE EXTENSION IF NOT EXISTS btree_gist;
-  ALTER TABLE appointment ADD CONSTRAINT appointment_no_overlap
-    EXCLUDE USING gist (coach_id WITH =, occupied WITH &&)
-    WHERE (status = 'SCHEDULED');
+  ALTER TABLE "Appointment" ADD CONSTRAINT "Appointment_no_overlap"
+    EXCLUDE USING gist ("coachId" WITH =, tstzrange("occupiedStart", "occupiedEnd", '[)') WITH &&)
+    WHERE ("status" = 'SCHEDULED');
   ```
+  All instants are `timestamptz(3)` (`@db.Timestamptz(3)` on every Prisma `DateTime`). Prisma's default naming is kept (quoted PascalCase tables, camelCase columns).
 * **`Booking`** — one row per client seat in an appointment. Capacity for group sessions is enforced inside a transaction that takes `SELECT … FOR UPDATE` on the appointment row and counts active bookings.
 * Booking a new 1:1 slot = insert Appointment + Booking in one transaction; a concurrent insert fails with SQLSTATE `23P01`, which the service maps to a friendly "slot just taken" error. An integration test fires N parallel bookings at one slot and asserts exactly one wins.
 * When the last active booking of an appointment is cancelled, the appointment flips to `CANCELLED` and leaves the constraint — the slot becomes bookable again and the waitlist fan-out job is enqueued.
@@ -846,6 +847,12 @@ Every phase ends with: `pnpm db:migrate` clean on an empty DB → `pnpm db:seed`
 11. Vitest config (unit + integration projects), test DB setup/teardown, factories.
 12. Seed: 1 admin, 3 coaches (different timezones/currencies incl. Asia/Manila PHP), 10 clients, coach-client links, global exercise library (~80 exercises), specialties. (Bookings/packages/programs seeded in the phase that builds them, but the seed script is structured so the final seed matches the brief.)
 13. README: setup, env vars, commands. Optional: GitHub Actions CI running lint/typecheck/tests with a Postgres service.
+
+**Phase 1 implementation notes**
+- Next.js 16 specifics: `middleware` is now `proxy.ts`; Cache Components is on, so every session read sits behind a `<Suspense>` boundary (authenticated layouts wrap their shell in one).
+- shadcn/ui components were added by hand from the upstream sources because the registry (ui.shadcn.com) is blocked in the build sandbox; `components.json` is present so `pnpm dlx shadcn add` works elsewhere.
+- Server-rendered forms put saved values into the HTML (`registerWithDefault`) and stay disabled until hydrated, so slow connections never show blank, editable fields.
+- Bookings, services, packages and programs are seeded in the phases that build them.
 
 ### Phase 2 — Scheduling core
 1. `domain/intervals` (+ property tests), `domain/recurrence` (RRULE subset: WEEKLY with BYDAY, COUNT/UNTIL; EXDATE), `domain/buffers`.
