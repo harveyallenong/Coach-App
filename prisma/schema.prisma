@@ -1,0 +1,1201 @@
+// CoachBook data model. See docs/PLAN.md §3.
+// Constraints Prisma can't express (exclusion constraint, CHECKs) live in
+// hand-written SQL inside prisma/migrations.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Identity & roles ─────────────────────────────
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String?
+  email         String     @unique
+  emailVerified DateTime?  @db.Timestamptz(3)
+  image         String?
+  phone         String?
+  timezone      String     @default("Asia/Manila")
+  locale        String     @default("en-PH")
+  isAdmin       Boolean    @default(false)
+  status        UserStatus @default(ACTIVE)
+  icalToken     String     @unique @default(cuid())
+  deletedAt     DateTime?  @db.Timestamptz(3)
+  createdAt     DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime   @updatedAt @db.Timestamptz(3)
+
+  accounts                Account[]
+  sessions                Session[]
+  coachProfile            CoachProfile?
+  clientProfile           ClientProfile?
+  notificationPreferences NotificationPreference[]
+  pushSubscriptions       PushSubscription[]
+  auditLogs               AuditLog[]
+  notificationLogs        NotificationLog[]
+  messages                Message[]
+  conversationReads       ConversationRead[]
+  workoutComments         WorkoutComment[]
+  disputesOpened          Dispute[]                @relation("DisputeOpenedBy")
+  disputesResolved        Dispute[]                @relation("DisputeResolvedBy")
+}
+
+// Auth.js adapter models (shape required by @auth/prisma-adapter).
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime @db.Timestamptz(3)
+
+  @@id([identifier, token])
+}
+
+enum LateCancelPolicy {
+  FORFEIT
+  FEE
+  WAIVE
+}
+
+model CoachProfile {
+  id                      String           @id @default(cuid())
+  userId                  String           @unique
+  slug                    String           @unique
+  displayName             String
+  headline                String?
+  bio                     String?
+  photoKey                String?
+  certifications          Json             @default("[]")
+  city                    String?
+  serviceArea             String?
+  countryCode             String           @default("PH")
+  timezone                String           @default("Asia/Manila")
+  currency                String           @default("PHP")
+  marketplaceVisible      Boolean          @default(false)
+  acceptsInPerson         Boolean          @default(true)
+  acceptsOnline           Boolean          @default(false)
+  requiresApproval        Boolean          @default(false)
+  allowPayLater           Boolean          @default(true)
+  defaultBufferBeforeMin  Int              @default(5)
+  defaultBufferAfterMin   Int              @default(5)
+  minNoticeMin            Int              @default(180)
+  maxAdvanceDays          Int              @default(30)
+  slotStepMin             Int              @default(60)
+  cancellationWindowMin   Int              @default(30)
+  lateCancelPolicy        LateCancelPolicy @default(FORFEIT)
+  lateCancelFeePct        Int              @default(0)
+  reminderOffsetsMin      Int[]            @default([1440, 120])
+  showReliabilityPublicly Boolean          @default(false)
+  openSlotBroadcast       Boolean          @default(false)
+  /// [{ kind: "GCASH"|"MAYA"|"BANK", label, accountName, accountNumber, bankName? }]
+  payoutMethods           Json             @default("[]")
+  payoutQrKey             String?
+  nextReceiptNo           Int              @default(1)
+  createdAt               DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime         @updatedAt @db.Timestamptz(3)
+
+  user                  User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clients               CoachClient[]
+  specialties           CoachSpecialty[]
+  services              Service[]
+  availabilityRules     AvailabilityRule[]
+  availabilityOverrides AvailabilityOverride[]
+  timeBlocks            TimeBlock[]
+  appointments          Appointment[]
+  bookings              Booking[]
+  recurringSeries       RecurringSeries[]
+  waitlistEntries       WaitlistEntry[]
+  packages              Package[]
+  membershipPlans       MembershipPlan[]
+  creditGrants          CreditGrant[]
+  charges               Charge[]
+  payments              Payment[]
+  exercises             Exercise[]
+  programs              Program[]
+  conversations         Conversation[]
+  reviews               Review[]
+}
+
+model ClientProfile {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  goals               String?
+  healthNotes         String?
+  emergencyContact    Json?
+  openSlotAlertsOptIn Boolean  @default(false)
+  createdAt           DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(3)
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  coaches          CoachClient[]
+  bookings         Booking[]
+  recurringSeries  RecurringSeries[]
+  waitlistEntries  WaitlistEntry[]
+  packagePurchases PackagePurchase[]
+  memberships      Membership[]
+  creditGrants     CreditGrant[]
+  charges          Charge[]
+  payments         Payment[]
+  programs         Program[]
+  workoutLogs      WorkoutLog[]
+  personalRecords  PersonalRecord[]
+  bodyMetrics      BodyMetric[]
+  progressPhotos   ProgressPhoto[]
+  conversations    Conversation[]
+  reviews          Review[]
+}
+
+enum CoachClientStatus {
+  INVITED
+  ACTIVE
+  ARCHIVED
+}
+
+/// Ownership boundary: a coach may only see clients with an ACTIVE link.
+model CoachClient {
+  id          String            @id @default(cuid())
+  coachId     String
+  clientId    String?
+  inviteEmail String?
+  inviteToken String?           @unique
+  status      CoachClientStatus @default(INVITED)
+  coachNotes  String?
+  createdAt   DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime          @updatedAt @db.Timestamptz(3)
+
+  coach  CoachProfile   @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client ClientProfile? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([coachId, clientId])
+  @@index([clientId])
+}
+
+model Specialty {
+  id      String           @id @default(cuid())
+  slug    String           @unique
+  name    String
+  coaches CoachSpecialty[]
+}
+
+model CoachSpecialty {
+  coachId     String
+  specialtyId String
+
+  coach     CoachProfile @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  specialty Specialty    @relation(fields: [specialtyId], references: [id], onDelete: Cascade)
+
+  @@id([coachId, specialtyId])
+}
+
+enum NotificationChannelKind {
+  EMAIL
+  PUSH
+  SMS
+}
+
+enum NotificationEvent {
+  BOOKING_CONFIRMED
+  BOOKING_REQUESTED
+  BOOKING_CANCELLED
+  BOOKING_RESCHEDULED
+  BOOKING_REMINDER
+  PAYMENT_RECEIPT
+  PAYMENT_SUBMITTED
+  WAITLIST_OPENING
+  CHAT_MESSAGE
+  PROGRAM_ASSIGNED
+}
+
+model NotificationPreference {
+  userId  String
+  event   NotificationEvent
+  channel NotificationChannelKind
+  enabled Boolean
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, event, channel])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────────────────────── Scheduling & booking ─────────────────────────────
+
+enum LocationType {
+  IN_PERSON
+  ONLINE
+  BOTH
+}
+
+model Service {
+  id              String       @id @default(cuid())
+  coachId         String
+  name            String
+  description     String?
+  durationMin     Int
+  locationType    LocationType @default(IN_PERSON)
+  priceMinor      Int
+  currency        String
+  capacity        Int          @default(1)
+  /// null = coach default
+  bufferBeforeMin Int?
+  /// null = coach default
+  bufferAfterMin  Int?
+  isActive        Boolean      @default(true)
+  isPublic        Boolean      @default(true)
+  color           String?
+  createdAt       DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(3)
+
+  coach              CoachProfile            @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  appointments       Appointment[]
+  recurringSeries    RecurringSeries[]
+  waitlistEntries    WaitlistEntry[]
+  packageServices    PackageService[]
+  membershipServices MembershipPlanService[]
+
+  @@index([coachId])
+}
+
+/// Weekly working hours in the coach's local time.
+model AvailabilityRule {
+  id          String   @id @default(cuid())
+  coachId     String
+  /// 1 = Monday … 7 = Sunday (ISO, matches Luxon)
+  weekday     Int
+  startMinute Int
+  endMinute   Int
+  /// Allowed services for this window (mixed block). Empty = all active services.
+  serviceIds  String[] @default([])
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  coach CoachProfile @relation(fields: [coachId], references: [id], onDelete: Cascade)
+
+  @@index([coachId])
+}
+
+/// Extra availability on a specific local date.
+model AvailabilityOverride {
+  id          String   @id @default(cuid())
+  coachId     String
+  localDate   DateTime @db.Date
+  startMinute Int
+  endMinute   Int
+  serviceIds  String[] @default([])
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  coach CoachProfile @relation(fields: [coachId], references: [id], onDelete: Cascade)
+
+  @@index([coachId, localDate])
+}
+
+enum TimeBlockKind {
+  PERSONAL
+  OTHER_JOB
+  REST
+  OTHER
+}
+
+/// Time the coach is unavailable. Single (rrule null) or recurring.
+model TimeBlock {
+  id        String        @id @default(cuid())
+  coachId   String
+  kind      TimeBlockKind
+  title     String?
+  startAt   DateTime      @db.Timestamptz(3)
+  endAt     DateTime      @db.Timestamptz(3)
+  /// RFC 5545 subset (FREQ=WEEKLY;BYDAY=…;UNTIL/COUNT), evaluated in `tz`
+  rrule     String?
+  tz        String
+  exDates   DateTime[]    @db.Date
+  createdAt DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime      @updatedAt @db.Timestamptz(3)
+
+  coach CoachProfile @relation(fields: [coachId], references: [id], onDelete: Cascade)
+
+  @@index([coachId])
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+enum AppointmentLocation {
+  IN_PERSON
+  ONLINE
+}
+
+/// Occupied coach time (a 1:1 session or a group class).
+/// occupiedStart/End include buffers; the exclusion constraint
+/// "Appointment_no_overlap" prevents overlapping SCHEDULED rows per coach.
+model Appointment {
+  id              String              @id @default(cuid())
+  coachId         String
+  serviceId       String
+  startAt         DateTime            @db.Timestamptz(3)
+  endAt           DateTime            @db.Timestamptz(3)
+  bufferBeforeMin Int
+  bufferAfterMin  Int
+  occupiedStart   DateTime            @db.Timestamptz(3)
+  occupiedEnd     DateTime            @db.Timestamptz(3)
+  capacity        Int
+  locationType    AppointmentLocation
+  locationText    String?
+  videoUrl        String?
+  status          AppointmentStatus   @default(SCHEDULED)
+  createdById     String
+  createdAt       DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime            @updatedAt @db.Timestamptz(3)
+
+  coach    CoachProfile @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  service  Service      @relation(fields: [serviceId], references: [id])
+  bookings Booking[]
+
+  @@index([coachId, startAt])
+}
+
+enum BookingStatus {
+  REQUESTED
+  DECLINED
+  PENDING_PAYMENT
+  EXPIRED
+  CONFIRMED
+  COMPLETED
+  CANCELLED_BY_CLIENT
+  CANCELLED_BY_COACH
+  LATE_CANCEL
+  NO_SHOW
+}
+
+enum BookingSource {
+  CLIENT
+  COACH
+}
+
+enum PaymentMode {
+  ONLINE
+  CREDIT
+  PAY_LATER
+  FREE
+}
+
+model Booking {
+  id                 String        @id @default(cuid())
+  appointmentId      String
+  clientId           String
+  coachId            String
+  seriesId           String?
+  status             BookingStatus
+  source             BookingSource
+  paymentMode        PaymentMode
+  priceMinor         Int
+  currency           String
+  holdExpiresAt      DateTime?     @db.Timestamptz(3)
+  cancelledAt        DateTime?     @db.Timestamptz(3)
+  cancelledById      String?
+  cancelReason       String?
+  cancelInsideWindow Boolean?
+  rescheduledFromId  String?       @unique
+  createdById        String
+  createdAt          DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime      @updatedAt @db.Timestamptz(3)
+
+  appointment     Appointment         @relation(fields: [appointmentId], references: [id])
+  client          ClientProfile       @relation(fields: [clientId], references: [id])
+  coach           CoachProfile        @relation(fields: [coachId], references: [id])
+  series          RecurringSeries?    @relation(fields: [seriesId], references: [id])
+  rescheduledFrom Booking?            @relation("Reschedule", fields: [rescheduledFromId], references: [id])
+  rescheduledTo   Booking?            @relation("Reschedule")
+  sessionNote     SessionNote?
+  creditEntries   CreditLedgerEntry[]
+  charges         Charge[]
+  messages        Message[]
+  reviews         Review[]
+  disputes        Dispute[]
+
+  @@index([clientId, status])
+  @@index([coachId, status])
+  @@index([appointmentId])
+}
+
+enum SeriesStatus {
+  ACTIVE
+  ENDED
+  CANCELLED
+}
+
+model RecurringSeries {
+  id              String       @id @default(cuid())
+  coachId         String
+  clientId        String
+  serviceId       String
+  rrule           String
+  tz              String
+  occurrenceCount Int
+  status          SeriesStatus @default(ACTIVE)
+  createdAt       DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(3)
+
+  coach    CoachProfile  @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client   ClientProfile @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service  Service       @relation(fields: [serviceId], references: [id])
+  bookings Booking[]
+}
+
+enum WaitlistStatus {
+  ACTIVE
+  NOTIFIED
+  FULFILLED
+  EXPIRED
+}
+
+model WaitlistEntry {
+  id         String         @id @default(cuid())
+  coachId    String
+  clientId   String
+  /// null = any service
+  serviceId  String?
+  localDate  DateTime       @db.Date
+  fromMinute Int
+  toMinute   Int
+  status     WaitlistStatus @default(ACTIVE)
+  createdAt  DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime       @updatedAt @db.Timestamptz(3)
+
+  coach   CoachProfile  @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client  ClientProfile @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service Service?      @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([coachId, localDate, status])
+}
+
+model SessionNote {
+  id        String   @id @default(cuid())
+  bookingId String   @unique
+  body      String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────────── Payments, packages & credits ─────────────────────────────
+
+model Package {
+  id           String   @id @default(cuid())
+  coachId      String
+  name         String
+  description  String?
+  sessionCount Int
+  priceMinor   Int
+  currency     String
+  validityDays Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  coach     CoachProfile      @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  services  PackageService[]
+  purchases PackagePurchase[]
+
+  @@index([coachId])
+}
+
+model PackageService {
+  packageId String
+  serviceId String
+
+  package Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([packageId, serviceId])
+}
+
+model PackagePurchase {
+  id          String   @id @default(cuid())
+  packageId   String
+  clientId    String
+  purchasedAt DateTime @db.Timestamptz(3)
+  expiresAt   DateTime @db.Timestamptz(3)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  package     Package       @relation(fields: [packageId], references: [id])
+  client      ClientProfile @relation(fields: [clientId], references: [id])
+  creditGrant CreditGrant?
+  charges     Charge[]
+  reviews     Review[]
+}
+
+enum BillingInterval {
+  MONTH
+}
+
+model MembershipPlan {
+  id               String          @id @default(cuid())
+  coachId          String
+  name             String
+  description      String?
+  priceMinor       Int
+  currency         String
+  interval         BillingInterval @default(MONTH)
+  /// null = unlimited
+  creditsPerPeriod Int?
+  providerPriceId  String?
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime        @updatedAt @db.Timestamptz(3)
+
+  coach       CoachProfile            @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  services    MembershipPlanService[]
+  memberships Membership[]
+}
+
+model MembershipPlanService {
+  planId    String
+  serviceId String
+
+  plan    MembershipPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  service Service        @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([planId, serviceId])
+}
+
+enum MembershipStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+model Membership {
+  id                     String           @id @default(cuid())
+  planId                 String
+  clientId               String
+  status                 MembershipStatus @default(ACTIVE)
+  currentPeriodStart     DateTime         @db.Timestamptz(3)
+  currentPeriodEnd       DateTime         @db.Timestamptz(3)
+  providerSubscriptionId String?          @unique
+  createdAt              DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime         @updatedAt @db.Timestamptz(3)
+
+  plan         MembershipPlan @relation(fields: [planId], references: [id])
+  client       ClientProfile  @relation(fields: [clientId], references: [id])
+  creditGrants CreditGrant[]
+  charges      Charge[]
+}
+
+enum CreditSource {
+  PACKAGE
+  MEMBERSHIP
+  MANUAL
+  CANCELLATION
+}
+
+model CreditGrant {
+  id                String       @id @default(cuid())
+  coachId           String
+  clientId          String
+  source            CreditSource
+  packagePurchaseId String?      @unique
+  membershipId      String?
+  /// null = unlimited (membership)
+  quantity          Int?
+  expiresAt         DateTime?    @db.Timestamptz(3)
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+
+  coach           CoachProfile        @relation(fields: [coachId], references: [id])
+  client          ClientProfile       @relation(fields: [clientId], references: [id])
+  packagePurchase PackagePurchase?    @relation(fields: [packagePurchaseId], references: [id])
+  membership      Membership?         @relation(fields: [membershipId], references: [id])
+  entries         CreditLedgerEntry[]
+
+  @@index([clientId, coachId])
+}
+
+enum CreditReason {
+  GRANT
+  CONSUME
+  RETURN
+  FORFEIT
+  EXPIRE
+  ADJUST
+}
+
+/// Append-only credit ledger. Balance per grant = SUM(delta).
+model CreditLedgerEntry {
+  id             String       @id @default(cuid())
+  grantId        String
+  bookingId      String?
+  delta          Int
+  reason         CreditReason
+  idempotencyKey String       @unique
+  note           String?
+  createdById    String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(3)
+
+  grant   CreditGrant @relation(fields: [grantId], references: [id])
+  booking Booking?    @relation(fields: [bookingId], references: [id])
+
+  @@index([grantId])
+}
+
+enum ChargeKind {
+  SESSION
+  LATE_CANCEL_FEE
+  NO_SHOW_FEE
+  PACKAGE
+  MEMBERSHIP
+}
+
+enum ChargeStatus {
+  OPEN
+  PAID
+  VOID
+}
+
+/// An amount the client owes the coach. Outstanding balance = SUM(OPEN).
+model Charge {
+  id                String       @id @default(cuid())
+  coachId           String
+  clientId          String
+  kind              ChargeKind
+  amountMinor       Int
+  currency          String
+  status            ChargeStatus @default(OPEN)
+  bookingId         String?
+  packagePurchaseId String?
+  membershipId      String?
+  paymentId         String?
+  idempotencyKey    String       @unique
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @db.Timestamptz(3)
+
+  coach           CoachProfile     @relation(fields: [coachId], references: [id])
+  client          ClientProfile    @relation(fields: [clientId], references: [id])
+  booking         Booking?         @relation(fields: [bookingId], references: [id])
+  packagePurchase PackagePurchase? @relation(fields: [packagePurchaseId], references: [id])
+  membership      Membership?      @relation(fields: [membershipId], references: [id])
+  payment         Payment?         @relation(fields: [paymentId], references: [id])
+
+  @@index([coachId, status])
+  @@index([clientId, status])
+}
+
+enum PaymentMethod {
+  GCASH
+  MAYA
+  QRPH
+  BANK_TRANSFER
+  CASH
+  CARD
+  OTHER
+}
+
+enum PaymentStatus {
+  SUBMITTED
+  SUCCEEDED
+  REJECTED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Payment {
+  id               String        @id @default(cuid())
+  coachId          String
+  clientId         String
+  amountMinor      Int
+  platformFeeMinor Int           @default(0)
+  currency         String
+  method           PaymentMethod
+  /// "direct" | "manual" | future providers
+  provider         String
+  providerRef      String?       @unique
+  referenceNumber  String?
+  proofKey         String?
+  status           PaymentStatus
+  rejectReason     String?
+  recordedById     String
+  confirmedById    String?
+  paidAt           DateTime?     @db.Timestamptz(3)
+  createdAt        DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime      @updatedAt @db.Timestamptz(3)
+
+  coach    CoachProfile  @relation(fields: [coachId], references: [id])
+  client   ClientProfile @relation(fields: [clientId], references: [id])
+  charges  Charge[]
+  refunds  Refund[]
+  receipt  Receipt?
+  disputes Dispute[]
+
+  @@index([coachId, status])
+}
+
+enum RefundStatus {
+  OWED
+  SUCCEEDED
+  FAILED
+}
+
+model Refund {
+  id               String       @id @default(cuid())
+  paymentId        String
+  amountMinor      Int
+  status           RefundStatus
+  reason           String
+  providerRefundId String?      @unique
+  referenceNumber  String?
+  idempotencyKey   String       @unique
+  createdAt        DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+}
+
+model Receipt {
+  id        String   @id @default(cuid())
+  paymentId String   @unique
+  number    String
+  pdfKey    String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String
+  eventId     String
+  type        String
+  payload     Json
+  processedAt DateTime? @db.Timestamptz(3)
+  error       String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@unique([provider, eventId])
+}
+
+model PlatformSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
+
+// ───────────────────────────── Programs, logging & progress ─────────────────────────────
+
+model Exercise {
+  id           String   @id @default(cuid())
+  /// null = global library
+  coachId      String?
+  name         String
+  muscleGroups String[]
+  equipment    String[]
+  instructions String?
+  videoUrl     String?
+  isArchived   Boolean  @default(false)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  coach            CoachProfile?     @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  workoutExercises WorkoutExercise[]
+  setLogs          SetLog[]
+  personalRecords  PersonalRecord[]
+
+  @@index([coachId])
+}
+
+enum ProgramStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+model Program {
+  id           String        @id @default(cuid())
+  coachId      String
+  /// null = template
+  clientId     String?
+  copiedFromId String?
+  name         String
+  description  String?
+  isTemplate   Boolean       @default(false)
+  startDate    DateTime?     @db.Date
+  durationDays Int?
+  status       ProgramStatus @default(DRAFT)
+  createdAt    DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @db.Timestamptz(3)
+
+  coach      CoachProfile   @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client     ClientProfile? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  copiedFrom Program?       @relation("ProgramCopies", fields: [copiedFromId], references: [id], onDelete: SetNull)
+  copies     Program[]      @relation("ProgramCopies")
+  weeks      ProgramWeek[]
+  reviews    Review[]
+
+  @@index([coachId])
+  @@index([clientId])
+}
+
+model ProgramWeek {
+  id        String  @id @default(cuid())
+  programId String
+  index     Int
+  notes     String?
+
+  program  Program   @relation(fields: [programId], references: [id], onDelete: Cascade)
+  workouts Workout[]
+
+  @@unique([programId, index])
+}
+
+model Workout {
+  id       String  @id @default(cuid())
+  weekId   String
+  dayIndex Int
+  name     String
+  notes    String?
+
+  week      ProgramWeek       @relation(fields: [weekId], references: [id], onDelete: Cascade)
+  exercises WorkoutExercise[]
+  logs      WorkoutLog[]
+}
+
+enum LoadType {
+  KG
+  LB
+  PCT_1RM
+  BODYWEIGHT
+  NONE
+}
+
+model WorkoutExercise {
+  id            String   @id @default(cuid())
+  workoutId     String
+  exerciseId    String
+  order         Int
+  sets          Int
+  reps          String
+  loadType      LoadType @default(NONE)
+  loadValue     Decimal? @db.Decimal(7, 2)
+  tempo         String?
+  restSec       Int?
+  rpe           Decimal? @db.Decimal(3, 1)
+  supersetGroup String?
+  notes         String?
+
+  workout  Workout  @relation(fields: [workoutId], references: [id], onDelete: Cascade)
+  exercise Exercise @relation(fields: [exerciseId], references: [id])
+  setLogs  SetLog[]
+}
+
+enum WorkoutLogStatus {
+  IN_PROGRESS
+  COMPLETED
+  SKIPPED
+}
+
+model WorkoutLog {
+  id          String           @id @default(cuid())
+  clientId    String
+  /// null = ad-hoc workout
+  workoutId   String?
+  performedAt DateTime         @db.Timestamptz(3)
+  status      WorkoutLogStatus @default(IN_PROGRESS)
+  notes       String?
+  createdAt   DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime         @updatedAt @db.Timestamptz(3)
+
+  client   ClientProfile    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  workout  Workout?         @relation(fields: [workoutId], references: [id], onDelete: SetNull)
+  sets     SetLog[]
+  comments WorkoutComment[]
+
+  @@index([clientId, performedAt])
+}
+
+enum WeightUnit {
+  KG
+  LB
+}
+
+model SetLog {
+  id                String     @id @default(cuid())
+  workoutLogId      String
+  workoutExerciseId String?
+  exerciseId        String
+  setIndex          Int
+  reps              Int?
+  weight            Decimal?   @db.Decimal(7, 2)
+  unit              WeightUnit @default(KG)
+  rpe               Decimal?   @db.Decimal(3, 1)
+  done              Boolean    @default(false)
+  notes             String?
+  createdAt         DateTime   @default(now()) @db.Timestamptz(3)
+
+  workoutLog      WorkoutLog       @relation(fields: [workoutLogId], references: [id], onDelete: Cascade)
+  workoutExercise WorkoutExercise? @relation(fields: [workoutExerciseId], references: [id], onDelete: SetNull)
+  exercise        Exercise         @relation(fields: [exerciseId], references: [id])
+  personalRecords PersonalRecord[]
+}
+
+model WorkoutComment {
+  id           String   @id @default(cuid())
+  workoutLogId String
+  authorId     String
+  body         String
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  workoutLog WorkoutLog @relation(fields: [workoutLogId], references: [id], onDelete: Cascade)
+  author     User       @relation(fields: [authorId], references: [id])
+}
+
+enum PersonalRecordKind {
+  EST_1RM
+  MAX_WEIGHT
+  REPS_AT_WEIGHT
+}
+
+model PersonalRecord {
+  id         String             @id @default(cuid())
+  clientId   String
+  exerciseId String
+  kind       PersonalRecordKind
+  value      Decimal            @db.Decimal(8, 2)
+  setLogId   String?
+  achievedAt DateTime           @db.Timestamptz(3)
+
+  client   ClientProfile @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  exercise Exercise      @relation(fields: [exerciseId], references: [id])
+  setLog   SetLog?       @relation(fields: [setLogId], references: [id], onDelete: SetNull)
+
+  @@index([clientId, exerciseId])
+}
+
+model BodyMetric {
+  id           String   @id @default(cuid())
+  clientId     String
+  measuredAt   DateTime @db.Timestamptz(3)
+  weightKg     Decimal? @db.Decimal(5, 2)
+  bodyFatPct   Decimal? @db.Decimal(4, 1)
+  /// { waistCm, hipsCm, chestCm, … }
+  measurements Json?
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  client ClientProfile @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, measuredAt])
+}
+
+model ProgressPhoto {
+  id              String   @id @default(cuid())
+  clientId        String
+  storageKey      String
+  pose            String?
+  takenAt         DateTime @db.Timestamptz(3)
+  sharedWithCoach Boolean  @default(false)
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  client ClientProfile @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, takenAt])
+}
+
+// ───────────────────────────── Communication ─────────────────────────────
+
+model Conversation {
+  id            String    @id @default(cuid())
+  coachId       String
+  clientId      String
+  lastMessageAt DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  coach    CoachProfile       @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client   ClientProfile      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  messages Message[]
+  reads    ConversationRead[]
+
+  @@unique([coachId, clientId])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  senderId       String
+  body           String?
+  attachmentKey  String?
+  bookingId      String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation(fields: [senderId], references: [id])
+  booking      Booking?     @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([conversationId, createdAt])
+}
+
+model ConversationRead {
+  conversationId String
+  userId         String
+  lastReadAt     DateTime @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+}
+
+// ───────────────────────────── Marketplace ─────────────────────────────
+
+enum ReviewStatus {
+  PUBLISHED
+  HIDDEN
+}
+
+/// One review per (coach, client, periodKey) — see ADR 0006.
+model Review {
+  id                String       @id @default(cuid())
+  coachId           String
+  clientId          String
+  bookingId         String
+  programId         String?
+  packagePurchaseId String?
+  periodKey         String
+  periodStart       DateTime     @db.Date
+  rating            Int
+  body              String?
+  coachReply        String?
+  status            ReviewStatus @default(PUBLISHED)
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @db.Timestamptz(3)
+
+  coach           CoachProfile     @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  client          ClientProfile    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  booking         Booking          @relation(fields: [bookingId], references: [id])
+  program         Program?         @relation(fields: [programId], references: [id], onDelete: SetNull)
+  packagePurchase PackagePurchase? @relation(fields: [packagePurchaseId], references: [id], onDelete: SetNull)
+
+  @@unique([coachId, clientId, periodKey])
+  @@index([coachId, status])
+}
+
+// ───────────────────────────── Platform ─────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  requestId  String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
+
+enum NotificationLogStatus {
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model NotificationLog {
+  id        String                  @id @default(cuid())
+  userId    String
+  channel   NotificationChannelKind
+  event     NotificationEvent
+  dedupeKey String                  @unique
+  status    NotificationLogStatus
+  error     String?
+  createdAt DateTime                @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+enum DisputeStatus {
+  OPEN
+  RESOLVED
+  REJECTED
+}
+
+model Dispute {
+  id           String        @id @default(cuid())
+  openedById   String
+  resolvedById String?
+  bookingId    String?
+  paymentId    String?
+  status       DisputeStatus @default(OPEN)
+  description  String
+  resolution   String?
+  createdAt    DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @db.Timestamptz(3)
+
+  openedBy   User     @relation("DisputeOpenedBy", fields: [openedById], references: [id])
+  resolvedBy User?    @relation("DisputeResolvedBy", fields: [resolvedById], references: [id])
+  booking    Booking? @relation(fields: [bookingId], references: [id])
+  payment    Payment? @relation(fields: [paymentId], references: [id])
+}
+
+/// Fixed-window rate limiter storage.
+model RateLimitBucket {
+  key         String   @id
+  count       Int
+  windowStart DateTime @db.Timestamptz(3)
+}
