@@ -6,11 +6,21 @@ import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 
 import { PrismaClient } from "../../src/generated/prisma/client";
+import { pgConnectionOptions, resolveDatabaseUrl } from "../../src/server/database-url";
 import { EXERCISES } from "./exercises";
 
+const databaseUrl = resolveDatabaseUrl(process.env);
+if (!databaseUrl) throw new Error("DATABASE_URL is not set");
 const db = new PrismaClient({
-  adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }),
+  adapter: new PrismaPg(
+    pgConnectionOptions(databaseUrl, process.env.DATABASE_CA_CERT || undefined),
+  ),
 });
+
+// On a real deployment the seeded @coachbook.local addresses can't receive
+// magic links. These let you take over a demo coach/client with your own email.
+const SEED_COACH_EMAIL = process.env.SEED_COACH_EMAIL?.trim().toLowerCase() || null;
+const SEED_CLIENT_EMAIL = process.env.SEED_CLIENT_EMAIL?.trim().toLowerCase() || null;
 
 const SPECIALTIES = [
   ["strength", "Strength training"],
@@ -102,8 +112,33 @@ const LINKS: Record<number, string[]> = {
 
 const emailFor = (name: string) => `${name.toLowerCase().replace(/[^a-z]+/g, ".")}@coachbook.local`;
 
+/**
+ * The seeded user for `defaultEmail`, or — when `overrideEmail` is given — the
+ * account with that email (renaming an earlier-seeded placeholder if needed).
+ */
+async function seedUser(
+  defaultEmail: string,
+  overrideEmail: string | null,
+  data: { name: string; timezone: string; emailVerified: Date },
+) {
+  const email = overrideEmail ?? defaultEmail;
+  const existing = await db.user.findUnique({ where: { email } });
+  if (existing) return existing;
+  if (overrideEmail) {
+    const placeholder = await db.user.findUnique({ where: { email: defaultEmail } });
+    if (placeholder) return db.user.update({ where: { id: placeholder.id }, data: { email } });
+  }
+  return db.user.create({ data: { email, ...data } });
+}
+
 async function main() {
   const now = new Date();
+
+  // Deploys run the seed with SEED_IF_EMPTY=1 so real data is never overwritten.
+  if (process.env.SEED_IF_EMPTY === "1" && (await db.coachProfile.count()) > 0) {
+    console.log("Database already has data; skipping seed.");
+    return;
+  }
 
   await db.user.upsert({
     where: { email: "admin@coachbook.local" },
@@ -122,11 +157,20 @@ async function main() {
 
   const coachIds = new Map<string, string>();
   for (const c of COACHES) {
-    const user = await db.user.upsert({
-      where: { email: c.email },
-      update: {},
-      create: { email: c.email, name: c.name, timezone: c.timezone, emailVerified: now },
+    const override = c.slug === "ana-reyes" ? SEED_COACH_EMAIL : null;
+    const user = await seedUser(c.email, override, {
+      name: c.name,
+      timezone: c.timezone,
+      emailVerified: now,
     });
+    const ownProfile = await db.coachProfile.findUnique({ where: { userId: user.id } });
+    if (ownProfile && ownProfile.slug !== c.slug) {
+      console.warn(
+        `${user.email} already has coach profile "${ownProfile.slug}"; not attaching ${c.slug}.`,
+      );
+      coachIds.set(c.slug, ownProfile.id);
+      continue;
+    }
     const profile = {
       displayName: c.name,
       headline: c.headline,
@@ -141,7 +185,8 @@ async function main() {
     };
     const coach = await db.coachProfile.upsert({
       where: { slug: c.slug },
-      update: profile,
+      // Only an override moves the profile to a different account.
+      update: override ? { ...profile, userId: user.id } : profile,
       create: { ...profile, slug: c.slug, userId: user.id },
     });
     coachIds.set(c.slug, coach.id);
@@ -156,11 +201,8 @@ async function main() {
   }
 
   for (const [i, [name, timezone, goals]] of CLIENTS.entries()) {
-    const user = await db.user.upsert({
-      where: { email: emailFor(name) },
-      update: {},
-      create: { email: emailFor(name), name, timezone, emailVerified: now },
-    });
+    const override = i === 0 ? SEED_CLIENT_EMAIL : null;
+    const user = await seedUser(emailFor(name), override, { name, timezone, emailVerified: now });
     const client = await db.clientProfile.upsert({
       where: { userId: user.id },
       update: { goals },
