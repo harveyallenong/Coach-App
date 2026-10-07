@@ -68,6 +68,8 @@ shadcn components: `pnpm dlx shadcn add <name>` (if the registry is unreachable,
 **Data integrity**
 - The DB prevents double-booking: the exclusion constraint `Appointment_no_overlap` on `("coachId", tstzrange("occupiedStart", "occupiedEnd"))` where `status = 'SCHEDULED'`. Always write `occupiedStart/End` = start/end ± buffers (a CHECK enforces it). Don't replace it with app-only checks. Map SQLSTATE `23P01` to `SlotTaken`.
 - Every Prisma `DateTime` is `@db.Timestamptz(3)`.
+- Every new table's migration must `ALTER TABLE "X" ENABLE ROW LEVEL SECURITY;` (Supabase Data API lockdown, see `docs/DEPLOYMENT.md`). `tests/integration/rls.int.test.ts` fails otherwise.
+- Deployment: Vercel runs `pnpm vercel-build` (migrate deploy → seed if empty and `SEED_ON_DEPLOY=true` → build). DB URLs resolve via `src/server/database-url.ts`.
 - Group capacity is checked under `SELECT … FOR UPDATE` on the appointment row.
 - Changes that move money or credits are idempotent through unique `idempotencyKey` / `dedupeKey` columns.
 - Webhooks: verify the signature first, then dedupe on `WebhookEvent(provider, eventId)`.

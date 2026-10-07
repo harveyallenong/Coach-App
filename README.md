@@ -6,6 +6,7 @@ Scheduling, programs and payments for freelance fitness coaches. It's a mobile-f
 - Decisions: [`docs/decisions/`](docs/decisions)
 - Conventions for contributors and agents: [`CLAUDE.md`](CLAUDE.md)
 - Manual test scripts for each phase: [`docs/demo/`](docs/demo)
+- **Put it online (Vercel + Supabase): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)**
 
 ## Status
 
@@ -75,15 +76,19 @@ The seed also includes an open invite link for Ana: http://localhost:3000/invite
 
 | Variable | Required | Notes |
 |---|---|---|
-| `DATABASE_URL` | ✅ | Postgres connection string |
+| `DATABASE_URL` | ✅ | Postgres connection string. On Vercel + Supabase, the integration's `POSTGRES_PRISMA_URL` is used if this is unset |
+| `DIRECT_URL` | | Connection for migrations (Supabase: session mode). Falls back to `POSTGRES_URL_NON_POOLING`, then `DATABASE_URL` |
+| `DATABASE_CA_CERT` | | PEM of the database CA, to verify TLS |
+| `DATABASE_POOL_MAX` | | Connections per app instance (default 5) |
 | `TEST_DATABASE_URL` | for tests | Must point to a database whose name contains `test`; the test runner refuses anything else |
 | `SHADOW_DATABASE_URL` | for `db:migrate` | Prisma's scratch database used to compute migration diffs |
 | `AUTH_SECRET` | ✅ | At least 16 characters. Generate with `openssl rand -base64 32` |
 | `AUTH_TRUST_HOST` | | `true` behind proxies and on localhost |
-| `APP_URL`, `NEXT_PUBLIC_APP_URL` | | Base URL used in invite links |
+| `APP_URL` | | Base URL used in invite links. On Vercel, defaults to the production domain |
+| `SEED_ON_DEPLOY`, `SEED_COACH_EMAIL`, `SEED_CLIENT_EMAIL` | | Deployments: seed demo data once into an empty DB, and attach demo coach Ana / client Bea to your emails |
 | `ADMIN_EMAILS` | | Comma-separated; these users are made admins when they sign in |
 | `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` | | Enable "Continue with Google". Leave empty to hide the button |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | | Mailpit by default. For Resend use `smtp.resend.com`, port 465, user `resend` and your API key as the password |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | | Mailpit by default. Gmail: `smtp.gmail.com`, port 465, your address and an app password. Resend: `smtp.resend.com`, port 465, user `resend`, API key as password |
 | `EMAIL_FROM` | | Sender for magic links |
 | `LOG_LEVEL` | | pino level (`info` by default) |
 
