@@ -1,0 +1,6 @@
+src/generated
+pnpm-lock.yaml
+.next
+coverage
+prisma/migrations
+*.md
