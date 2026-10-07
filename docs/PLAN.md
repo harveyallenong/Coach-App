@@ -1,9 +1,9 @@
 # CoachBook — Implementation Plan
 
-Status: **DRAFT — awaiting approval** (Step 0.1)
+Status: **APPROVED with amendments** (Step 0.1, revision 2)
 Last updated: 2026-10-07
 
-This plan turns the product brief into an architecture, a data model, a folder layout and a phased task list. Section 9 lists the **open questions / proposed decisions** that need your sign-off before Phase 1 starts. Nothing in the brief's "Project Decisions" is changed here; where I had to fill a gap I've marked it **[PROPOSED]** and repeated it in Section 9.
+This plan turns the product brief into an architecture, a data model, a folder layout and a phased task list. Section 9 records the **decisions approved by the product owner**; each also has an ADR in `docs/decisions/`. The one change to a brief-level Project Decision (payments: direct-to-coach instead of Stripe as the default provider) was made explicitly by the product owner — see ADR 0005.
 
 ---
 
@@ -22,7 +22,7 @@ flowchart LR
     API["Route handlers<br/>/api/webhooks, /api/ical, /api/realtime, /api/cron"]
     SVC["Services (use-cases, transactions, authz)"]
     DOM["Domain modules (pure, no I/O)<br/>slots · buffers · cancellation · credits · recurrence · PRs"]
-    PROV["Provider adapters<br/>Payment · Video · Notification · Realtime · Storage"]
+    PROV["Provider adapters<br/>Payment (direct-to-coach) · Video · Notification · Realtime · Storage"]
   end
 
   subgraph Worker["Worker process (pg-boss)"]
@@ -31,7 +31,7 @@ flowchart LR
 
   DB[("PostgreSQL<br/>app schema + pgboss schema")]
   S3[("S3-compatible storage<br/>(MinIO locally)")]
-  EXT["Stripe · Resend/SMTP · Web Push · SMS · Jitsi"]
+  EXT["Resend/SMTP · Web Push · SMS · Jitsi<br/>(PayMongo later)"]
 
   UI --> RSC & SA & API
   RSC & SA & API --> SVC --> DOM
@@ -63,8 +63,8 @@ flowchart LR
 | Validation | Zod 4 — one schema per action, shared with forms via `react-hook-form` + `@hookform/resolvers` | Per brief. |
 | Time | Luxon (IANA zones, DST-correct arithmetic). All DB timestamps `timestamptz` in UTC. | Mature, small API surface, good DST semantics. |
 | Jobs | pg-boss on the same Postgres, separate `worker` process | Per brief; idempotent via `singletonKey` + DB dedupe keys. |
-| Realtime | `RealtimeProvider` interface; default = Postgres `LISTEN/NOTIFY` → SSE route; alt = Pusher-protocol (Soketi locally / Pusher in prod) | Per brief. See Q7 about Vercel. |
-| Payments | `PaymentProvider` interface; Stripe adapter (test mode); `manual` adapter for cash/bank/e-wallet | Per brief. |
+| Realtime | `RealtimeProvider` interface; default = Postgres `LISTEN/NOTIFY` → SSE route; alt = Pusher-protocol (Soketi locally / Pusher in prod) | Per brief. See D10 for Vercel. |
+| Payments | `PaymentProvider` interface. Launch adapter = **`direct`**: client pays the coach straight to their GCash / Maya / bank (QR Ph code + account details on the coach's profile), submits a reference no. and/or a proof screenshot, and the coach confirms. Plus `manual` (coach records cash/bank/e-wallet). Online checkout adapter (PayMongo) comes later through the same interface. | Product-owner decision (ADR 0005): Stripe doesn't serve Philippine merchants; money never passes through CoachBook at launch. |
 | Video | `VideoProvider`; Jitsi adapter (deterministic unguessable room names); Zoom/Meet stubs | Per brief. |
 | Notifications | `NotificationChannel` per channel: email (Resend or SMTP via Nodemailer; Mailpit locally), web push (`web-push` + VAPID), SMS (console/log stub) | Per brief. Templates via React Email. |
 | File storage | `StorageProvider`; S3-compatible (MinIO locally, any S3/R2 in prod). Private bucket, short-lived signed URLs | Progress photos & chat images must be private. |
@@ -93,14 +93,21 @@ We split "time the coach is occupied" from "who is attending":
 * When the last active booking of an appointment is cancelled, the appointment flips to `CANCELLED` and leaves the constraint — the slot becomes bookable again and the waitlist fan-out job is enqueued.
 * Time blocks are **not** part of the constraint (coaches may intentionally override their own blocks when booking on behalf of a client); the slot engine excludes them and the booking service re-checks them for client-initiated bookings.
 
-**[PROPOSED] Buffer semantics (Q3):** with a single exclusion constraint, buffers are *additive* — A's after-buffer and B's before-buffer cannot overlap (15 + 15 = 30 min gap). The alternative (`gap ≥ max(afterA, beforeB)`) needs a trigger instead of a constraint.
+**Buffer semantics (approved, ADR 0003):** default **5 min before and 5 min after** every session; coach-level default and per-service override remain configurable. Buffers are *additive* — A's after-buffer and B's before-buffer cannot overlap, so back-to-back sessions with defaults are 10 min apart. This is exactly what the single exclusion constraint enforces.
+
+### 1.3.1 Mixed blocks: 1:1 or group, first booking decides (approved, ADR 0002)
+A coach's availability window (weekly rule or date override) can be offered to several services, e.g. "Sat 7–9am: 60-min PT *or* 60-min Bootcamp (cap 8)". Each `AvailabilityRule` / `AvailabilityOverride` has an optional list of allowed services (`null` = all active services).
+* Until something is booked, the slot engine offers the time to every allowed service, both 1:1 and group.
+* The **first booking claims only its own time range** (+ buffers) by creating an `Appointment`. A 1:1 booking at 7:00 means 7:00–8:00 can't become a class; 8:00 is still open to either.
+* If the first booking is for a group service, its appointment gets the service's capacity. Other clients then see a **join** slot for it ("Bootcamp 7:00, 5 seats left") until it is full. 1:1 slots for that time disappear.
+* Races between a 1:1 booking and the first group booking for the same time are resolved by the same exclusion constraint: exactly one appointment wins.
 
 ### 1.4 Slot engine (pure module `src/server/domain/slots`)
 ```
 computeSlots({
   now, coachTz, rangeStartUtc, rangeEndUtc,
-  weeklyRules,        // [{weekday, startMinute, endMinute}] in coach-local time
-  dateOverrides,      // extra availability on specific local dates
+  weeklyRules,        // [{weekday, startMinute, endMinute, serviceIds|null}] in coach-local time
+  dateOverrides,      // extra availability on specific local dates (same shape)
   blocks,             // expanded block intervals (UTC) — recurrence pre-expanded by domain/recurrence
   busy,               // existing SCHEDULED appointments incl. their buffers (UTC)
   openGroupSessions,  // appointments of this service with seats left
@@ -108,9 +115,9 @@ computeSlots({
   policy:  { minNoticeMin, maxAdvanceDays, slotStepMin },
 }) => Slot[]  // { startUtc, endUtc, kind: 'new' | 'join', seatsLeft }
 ```
-Algorithm: build local-day working intervals per date (weekly rules ∪ overrides) → convert each to UTC with Luxon (handles DST gaps/overlaps) → subtract blocks and busy intervals → candidate starts on a `slotStepMin` grid aligned to the working-interval start → keep a candidate only if `[start − bufferBefore, end + bufferAfter)` fits fully inside free time → apply `now + minNotice ≤ start ≤ now + maxAdvance` → merge in joinable group sessions. Interval arithmetic lives in `domain/intervals.ts` (union / subtract / intersect on half-open intervals) with property-based tests (`fast-check`).
+Algorithm: build local-day working intervals per date (weekly rules ∪ overrides, keeping only windows that allow this service) → convert each to UTC with Luxon (handles DST gaps/overlaps) → subtract blocks and busy intervals → candidate starts on a `slotStepMin` grid aligned to the working-interval start → keep a candidate only if `[start − bufferBefore, end + bufferAfter)` fits fully inside free time → apply `now + minNotice ≤ start ≤ now + maxAdvance` → merge in joinable group sessions. Interval arithmetic lives in `domain/intervals.ts` (union / subtract / intersect on half-open intervals) with property-based tests (`fast-check`).
 
-Required test cases include: multiple ranges per day, back-to-back sessions, buffers at day edges, blocks partially covering a range, recurring blocks, overrides adding time on a day off, DST spring-forward (non-existent 02:30), DST fall-back (ambiguous 01:30), coach tz ≠ client tz, notice/window boundaries (inclusive/exclusive), group join slots, zero-availability day, Asia/Manila (no DST) and America/New_York / Europe/London (DST).
+Required test cases include: multiple ranges per day, back-to-back sessions, buffers at day edges, blocks partially covering a range, recurring blocks, overrides adding time on a day off, DST spring-forward (non-existent 02:30), DST fall-back (ambiguous 01:30), coach tz ≠ client tz, notice/window boundaries (inclusive/exclusive), group join slots, mixed blocks (1:1 and group competing for the same window), default 5+5 buffers, 60-min default step, zero-availability day, Asia/Manila (no DST) and America/New_York / Europe/London (DST).
 
 ---
 
@@ -134,7 +141,9 @@ Required test cases include: multiple ranges per day, back-to-back sessions, buf
 | 4.8 | PR detection (est. 1RM via Epley, max weight, rep PR at weight), compliance % | `domain/progress` |
 
 ### 2.1 Booking state machine
-Brief states plus **[PROPOSED]** additions (Q1): `requested`, `declined`, `expired`.
+Brief states plus the approved additions (ADR 0001): `requested`, `declined`, `expired`.
+
+With direct-to-coach payments, `pending_payment` means "client said they'll pay online and hasn't submitted proof yet". It moves to `confirmed` when the coach confirms the payment (or immediately, if the coach accepts pay-later). The hold timeout applies only while no proof has been submitted.
 
 ```mermaid
 stateDiagram-v2
@@ -144,8 +153,8 @@ stateDiagram-v2
   requested --> pending_payment: coach approves (online payment)
   requested --> confirmed: coach approves (credit / pay later)
   requested --> declined: coach declines
-  pending_payment --> confirmed: payment succeeded (webhook)
-  pending_payment --> expired: hold timeout (default 15 min)
+  pending_payment --> confirmed: coach confirms payment (or provider webhook)
+  pending_payment --> expired: no proof within hold (default 15 min)
   pending_payment --> cancelled_by_client
   confirmed --> cancelled_by_client: outside window
   confirmed --> late_cancel: client cancels inside window
@@ -156,17 +165,21 @@ stateDiagram-v2
 ```
 
 ### 2.2 Cancellation outcome table (implemented in `domain/cancellation`)
+Defaults (approved, ADR 0004): cancellation window **30 minutes** before start, late-cancel policy **`FORFEIT`**. Both remain coach-configurable.
+
 | Actor | When | Paid by | Status | Client gets | Coach stats |
 |---|---|---|---|---|---|
 | Client | outside window | credit | `cancelled_by_client` | credit returned | — |
-| Client | outside window | card/online | `cancelled_by_client` | full refund via provider | — |
-| Client | outside window | offline/unpaid | `cancelled_by_client` | open charge voided; if already paid offline → refund recorded or converted to credit (coach chooses) | — |
-| Client | inside window | credit | `late_cancel` | policy `FORFEIT`/`FEE` → credit forfeited; `WAIVE` → credit returned | — |
-| Client | inside window | card/online | `late_cancel` | `FORFEIT` → no refund; `FEE x%` → refund (100−x)%; `WAIVE` → full refund | — |
-| Client | inside window | offline/unpaid | `late_cancel` | `FORFEIT` → full price stays owed; `FEE x%` → x% stays owed; `WAIVE` → charge voided | — |
-| Coach | any | any | `cancelled_by_coach` | full refund / credit returned | if inside window → counted as late coach cancellation |
+| Client | outside window | paid (direct/online) | `cancelled_by_client` | full refund (coach refunds directly and records it) or credit, client's choice if coach allows | — |
+| Client | outside window | unpaid | `cancelled_by_client` | open charge voided | — |
+| Client | inside window | credit | `late_cancel` | `FORFEIT`/`FEE` → credit forfeited; `WAIVE` → credit returned | — |
+| Client | inside window | paid | `late_cancel` | `FORFEIT` → no refund; `FEE x%` → refund (100−x)%; `WAIVE` → full refund | — |
+| Client | inside window | unpaid | `late_cancel` | `FORFEIT` → full price stays owed; `FEE x%` → x% stays owed; `WAIVE` → charge voided | — |
+| Coach | any time, incl. inside window | any | `cancelled_by_coach` | **never forfeits**: credit returned / full refund / charge voided | inside window → counted as a late coach cancellation |
 
-[PROPOSED] Interpretation of "charge fee %" for credit-paid bookings (Q4): a credit can't be partially forfeited, so `FEE` behaves like `FORFEIT` for credits. Alternative: return the credit and create an x% fee charge.
+A credit can't be partially forfeited, so `FEE` behaves like `FORFEIT` for credit-paid bookings.
+
+Refunds of direct-to-coach payments happen outside CoachBook (the coach sends the money back). CoachBook creates an "owed refund" task for the coach and records it once the coach marks it done, with a reference number.
 
 ---
 
@@ -220,8 +233,11 @@ erDiagram
     int defaultBufferAfterMin
     int minNoticeMin
     int maxAdvanceDays
-    int slotStepMin
-    int cancellationWindowHours
+    int slotStepMin "default 60"
+    int cancellationWindowMin "default 30"
+    boolean allowPayLater "default true"
+    json payoutMethods "GCash/Maya/bank details"
+    string payoutQrKey "QR Ph image"
     enum lateCancelPolicy "FORFEIT|FEE|WAIVE"
     int lateCancelFeePct
     int[] reminderOffsetsMin "default 1440,120"
@@ -280,8 +296,8 @@ erDiagram
     int priceMinor
     string currency
     int capacity "default 1"
-    int bufferBeforeMin "nullable = coach default"
-    int bufferAfterMin "nullable = coach default"
+    int bufferBeforeMin "nullable = coach default (5)"
+    int bufferAfterMin "nullable = coach default (5)"
     boolean isActive
     boolean isPublic
     string color
@@ -292,6 +308,7 @@ erDiagram
     int weekday "0=Mon..6=Sun"
     int startMinute
     int endMinute
+    string[] serviceIds "null = all (mixed block)"
   }
   AvailabilityOverride {
     string id PK
@@ -299,6 +316,7 @@ erDiagram
     date localDate
     int startMinute
     int endMinute
+    string[] serviceIds "null = all (mixed block)"
   }
   TimeBlock {
     string id PK
@@ -449,12 +467,14 @@ erDiagram
     int amountMinor
     int platformFeeMinor
     string currency
-    enum method "CARD|CASH|BANK_TRANSFER|EWALLET|OTHER"
-    string provider "stripe|manual|..."
+    enum method "GCASH|MAYA|QRPH|BANK_TRANSFER|CASH|CARD|OTHER"
+    string provider "direct|manual|paymongo..."
     string providerRef UK
     string referenceNumber
-    enum status "PENDING|SUCCEEDED|FAILED|REFUNDED|PARTIALLY_REFUNDED"
+    string proofKey "uploaded screenshot (private)"
+    enum status "SUBMITTED|SUCCEEDED|REJECTED|REFUNDED|PARTIALLY_REFUNDED"
     string recordedById
+    string confirmedById
     datetime paidAt
   }
   Refund {
@@ -483,7 +503,8 @@ erDiagram
 * Credit balance = `SUM(delta)` per grant where not expired — the ledger is append-only; each mutation carries a unique `idempotencyKey` (e.g. `consume:<bookingId>`), so retries cannot double-spend/double-return.
 * "Outstanding balance" = `SUM(Charge.amountMinor WHERE status='OPEN')`.
 * `WebhookEvent` has `UNIQUE(provider, eventId)`; handlers run inside the same transaction that marks it processed.
-* `PayoutAccount` (coach ↔ Stripe Connect account) and `PlatformSetting` (key/value, e.g. `platformFeeBps = 0`) also live here — see Q5.
+* `PlatformSetting` (key/value, e.g. `platformFeeBps = 0`) also lives here. At launch money goes straight to coaches, so CoachBook has no payouts to make. The earnings dashboard shows *confirmed income*, *awaiting confirmation* and *outstanding balances* instead of "upcoming payouts". A `PayoutAccount` model is added when a platform-collected provider (PayMongo / Xendit sub-accounts) arrives.
+* `Refund` rows for direct payments start as `OWED` (the coach must send money back) and move to `SUCCEEDED` when the coach records the reference number.
 
 ### 3.4 Programs, logging & progress
 ```mermaid
@@ -625,7 +646,11 @@ erDiagram
     string id PK
     string coachId FK
     string clientId FK
-    string bookingId FK
+    string bookingId FK "a completed session"
+    string programId FK "review period = program"
+    string packagePurchaseId FK "or = package"
+    date periodStart
+    string periodKey UK "with coachId+clientId"
     int rating "1-5"
     text body
     text coachReply
@@ -659,6 +684,13 @@ erDiagram
     text resolution
   }
 ```
+**Review periods (approved, ADR 0006).** A client may leave **one review per period** with a coach, and must have at least one completed session in that period. A period is:
+1. an assigned **program**: its duration (a 10-day program allows 1 review in those 10 days, a 20-day program 1 in 20). `periodKey = program:<programId>`. Otherwise
+2. a **package** purchase, from purchase until the package is used up or expires. `periodKey = package:<purchaseId>`. Otherwise
+3. **single sessions only**: one rolling 30-day window, starting at the first completed session that isn't covered by 1 or 2. `periodKey = window:<yyyy-mm-dd start>`.
+
+If more than one applies, the program wins over the package. `UNIQUE(coachId, clientId, periodKey)` enforces the rule. The rule itself is `domain/reviews` and has its own tests. Ratings are aggregated across all periods.
+
 `Conversation` is `UNIQUE(coachId, clientId)`. `NotificationLog.dedupeKey` (e.g. `reminder:<bookingId>:1440:email`) is what makes reminder jobs idempotent across retries and restarts.
 
 ---
@@ -692,9 +724,9 @@ Returns a typed `Result<T, AppError>`; domain errors (`SlotTaken`, `OutsideWindo
 | `notification.send` | any event | `dedupeKey` |
 | `credits.expire` | daily cron | ledger `idempotencyKey=expire:<grant>` |
 | `membership.renew-credits` | provider webhook | `idempotencyKey=period:<membership>:<periodStart>` |
-| `recurring.extend` | daily cron (if series extend beyond window — Q2) | per occurrence date |
+| `recurring.extend` | daily cron (only if series are later made rolling — D8) | per occurrence date |
 
-Worker runs as `pnpm worker` (separate process / container). See Q7 for Vercel.
+Worker runs as `pnpm worker` (separate process / container). See D10 for Vercel.
 
 ### 4.4 Provider interfaces (sketch)
 ```ts
@@ -717,7 +749,7 @@ Business logic only sees `NormalizedPaymentEvent` (`payment.succeeded`, `payment
 * Rate limits: magic-link requests (per email + per IP), booking create/cancel (per user), chat send, webhook endpoints exempt but signature-verified.
 * Progress photos & chat images: private bucket, upload via presigned PUT, view via ≤5-min signed GET after authz check.
 * Security headers / CSP via `next.config` + middleware.
-* Data export: JSON (+ photos zip) generated by a job, emailed as signed link. Data deletion: see Q9.
+* Data export: JSON (+ photos zip) generated by a job, emailed as signed link. Data deletion: see D11.
 
 ### 4.6 Observability
 `pino` structured logs with `requestId`, `userId`, `jobId`; `AuditLog` rows written in the **same transaction** as the change for bookings, cancellations, reschedules, payments, refunds, credit adjustments, admin actions.
@@ -775,7 +807,7 @@ Web app manifest, icons, service worker (Serwist) for app-shell caching + web-pu
 │   │   ├── domain/             # PURE business rules (+ *.test.ts colocated)
 │   │   ├── services/           # use-cases (+ *.int.test.ts)
 │   │   ├── providers/
-│   │   │   ├── payment/{types.ts, stripe.ts, manual.ts, fake.ts, index.ts}
+│   │   │   ├── payment/{types.ts, direct.ts, manual.ts, fake.ts, index.ts}   # paymongo.ts later
 │   │   │   ├── video/{types.ts, jitsi.ts, zoom.stub.ts, meet.stub.ts}
 │   │   │   ├── notification/{email-resend.ts, email-smtp.ts, push.ts, sms-log.ts, templates/}
 │   │   │   ├── realtime/{pg-sse.ts, pusher.ts}
@@ -819,8 +851,8 @@ Every phase ends with: `pnpm db:migrate` clean on an empty DB → `pnpm db:seed`
 1. `domain/intervals` (+ property tests), `domain/recurrence` (RRULE subset: WEEKLY with BYDAY, COUNT/UNTIL; EXDATE), `domain/buffers`.
 2. `domain/slots` — full slot engine + the test matrix in §1.4.
 3. Services CRUD (duration, location type, price, capacity, buffer overrides, color).
-4. Availability editor: weekly multi-range per day, date overrides, time blocks (single + recurring) — mobile-friendly.
-5. Coach scheduling settings: default buffers, min notice, max advance, slot step, approval-required toggle.
+4. Availability editor: weekly multi-range per day, date overrides, time blocks (single + recurring), per-window service selection for mixed blocks — mobile-friendly.
+5. Coach scheduling settings: default buffers (5 + 5), min notice, max advance, slot step (default 60), approval-required toggle, pay-later toggle.
 6. Booking service: create (1:1 and group join) in a transaction; map `23P01` → `SlotTaken`; capacity check with row lock; block re-check for client bookings. Concurrency integration test.
 7. Client booking flow: coach → service → date strip → slots (rendered in client tz, coach tz shown) → confirm. In Phase 2 payment = "pay later" (OFFLINE) so the flow is usable; Phase 4 adds online payment & credits.
 8. Coach books on behalf of a client; booking requests (approval mode) with approve/decline.
@@ -833,7 +865,7 @@ Every phase ends with: `pnpm db:migrate` clean on an empty DB → `pnpm db:seed`
 ### Phase 3 — Policies & notifications
 1. `domain/cancellation` + full outcome table tests; `domain/reliability`.
 2. Cancel flow (reason required) for client and coach; reschedule = cancel + rebook in one transaction (both or neither).
-3. Coach policy settings UI (window, late-cancel policy, fee %), shown to clients before booking/cancelling.
+3. Coach policy settings UI (window — default 30 min, late-cancel policy — default FORFEIT, fee %), shown to clients before booking/cancelling.
 4. pg-boss setup, worker entrypoint, job registry; `pnpm worker`; graceful shutdown.
 5. Notification core: event → template (React Email) → per-user preferences → channels; `NotificationLog` dedupe.
 6. Channels: email (SMTP/Mailpit + Resend), web push (VAPID, service worker, subscribe UI), SMS log stub.
@@ -845,13 +877,16 @@ Every phase ends with: `pnpm db:migrate` clean on an empty DB → `pnpm db:seed`
 ### Phase 4 — Payments / POS
 1. `domain/money`, `domain/credits` (+ tests: FIFO by expiry, eligibility by service, expiry, return/forfeit idempotency).
 2. Package & membership plan CRUD; client purchase flows.
-3. `PaymentProvider` interface, Stripe adapter (Checkout, refunds, subscriptions, Connect per Q5), `manual` adapter, `fake` adapter for tests.
-4. Webhook route: signature verification, `WebhookEvent` dedupe, normalized event handling; integration tests with signed fixture payloads + replay test.
-5. Booking ↔ payment: pay online (→ `pending_payment` hold), pay with credit (consume), pay later (open `Charge`); cancellation outcomes wired to refunds/credit returns/fees.
-6. Offline payment recording (cash, bank transfer, e-wallet + reference no.), settle open charges.
-7. Refunds (full/partial) via provider; receipts (PDF + email) with per-coach numbering.
-8. Earnings dashboard: revenue by period, outstanding balances, upcoming payouts, platform fee setting (admin, default 0%).
-9. Seed: packages, a membership plan, purchases, mix of paid/unpaid bookings.
+3. Coach payout details: GCash / Maya / bank account fields + QR Ph image upload (shown to clients at checkout).
+4. `PaymentProvider` interface with a generic "async confirmation" flow, so a later PayMongo adapter only adds a webhook. Adapters: `direct` (client submits reference no. + optional proof screenshot to private storage; coach confirms or rejects), `manual` (coach records cash/bank/e-wallet), `fake` for tests.
+5. Webhook route skeleton + `WebhookEvent` dedupe, exercised by the `fake` provider (signature verification + replay tests), ready for PayMongo.
+6. Booking ↔ payment: pay now via direct transfer (→ `pending_payment` until proof submitted, then coach confirms), pay with credit (consume), pay later (open `Charge`). Cancellation outcomes wired to refunds owed / credit returns / fees.
+7. Coach "payments to confirm" inbox; settle open charges; reject with reason (notifies client).
+8. Refunds: record owed refunds, coach marks sent with a reference no.; receipts (PDF + email) with per-coach numbering.
+9. Earnings dashboard: income by period, awaiting confirmation, outstanding balances, refunds owed; platform fee setting (admin, default 0%, inactive while money goes direct).
+10. Seed: packages, a membership plan, purchases, mix of confirmed / awaiting-confirmation / unpaid bookings.
+
+PayMongo online checkout (cards, GCash, Maya, QR Ph) is a **later phase** after Phase 8, unless you pull it forward.
 
 ### Phase 5 — Programs & progress
 1. Exercise library (global + coach custom), search/filter.
@@ -871,12 +906,12 @@ Every phase ends with: `pnpm db:migrate` clean on an empty DB → `pnpm db:seed`
 ### Phase 7 — Marketplace
 1. Public coach profile page (SSR, OG tags), services & prices, availability preview, reviews.
 2. Search/filter: specialty, city/area, online vs in-person, price range, has availability in next 7 days (precomputed nightly + on change), rating; pagination.
-3. Reviews (eligibility rule, one per client-coach — Q8, coach reply, admin hide).
+3. Reviews (eligibility + review-period rule from ADR 0006, coach reply, admin hide).
 4. Visibility toggle; private coaches reachable via invite link only.
 5. Admin: users (suspend, roles), listings moderation, reviews, disputes, platform settings, audit log viewer.
 
 ### Phase 8 — Hardening
-1. Playwright E2E: (a) client books → pays (Stripe test / fake provider) → reminder job fires (time-travelled) → cancels → refund/credit; (b) coach books on behalf + offline payment; (c) recurring + per-occurrence cancel; (d) workout logging on mobile viewport.
+1. Playwright E2E: (a) client books → pays (direct transfer, coach confirms) → reminder job fires (time-travelled) → cancels → refund/credit; (b) coach books on behalf + offline payment; (c) recurring + per-occurrence cancel; (d) workout logging on mobile viewport.
 2. Accessibility pass: axe on key pages, keyboard nav for calendar & logger, contrast, focus states.
 3. Performance: bundle analysis, RSC streaming, indexes review (`EXPLAIN` on slot/search queries), image optimization, Lighthouse mobile ≥ 90 target.
 4. Security review: authz test sweep, rate limits, headers/CSP, dependency audit.
@@ -913,25 +948,26 @@ pnpm build
 
 ---
 
-## 9. Open questions & proposed decisions (please confirm or edit)
+## 9. Approved decisions (2026-10-07)
 
-Each has a recommended default; replying "approve defaults" accepts all of them.
+Each decision has an ADR in `docs/decisions/`. Changing any of them requires the product owner's sign-off.
 
-| # | Topic | Question / conflict | Recommended default |
+| # | Topic | Decision | ADR |
 |---|---|---|---|
-| Q1 | Booking states | The brief's 7 states don't cover approval-mode requests or unpaid holds that time out. | Add `requested`, `declined`, `expired` to the 7 listed states. |
-| Q2 | Recurring vs. max advance window | "Every MWF for 8 weeks" exceeds a 30-day advance window. | Recurring series ignore `maxAdvanceDays` (but still respect min notice). Occurrences that conflict are **skipped and reported**, not fail-all. All occurrences are created up front. |
-| Q3 | Buffer stacking | Should A's after-buffer and B's before-buffer be allowed to overlap? | No (additive) — enforceable by a pure exclusion constraint. Alternative needs a trigger. |
-| Q4 | "Charge fee %" for credit-paid late cancels | Can't forfeit part of a credit. | `FEE` forfeits the credit (same as `FORFEIT`). For card-paid → partial refund; for unpaid → x% charge stays owed. |
-| Q5 | Money flow / payouts | Is CoachBook the merchant collecting for coaches ("upcoming payouts", platform fee) or does each coach use their own Stripe? | **Stripe Connect Express** with destination charges + `application_fee_amount` (platform fee, default 0). Coach onboarding to Connect is required to accept online payments; offline payments work without it. |
-| Q6 | Pay-later bookings | Can clients book without paying (cash on the day), or only coach-created bookings? | Per-coach setting `allowPayLater` (default **on**, since most target coaches take cash/GCash today). Pay-later bookings are `confirmed` with an open `Charge`. Coach-created bookings always allow it. |
-| Q7 | Vercel limitations | Vercel can't run a long-lived pg-boss worker, and SSE functions have duration limits. | Docker deploy: worker container + SSE. Vercel deploy: worker runs on a small separate host (Railway/Fly/Render) **or** Vercel Cron hits `/api/cron/[job]` to drain due jobs each minute; realtime uses the Pusher adapter. I'll document both. |
-| Q8 | Reviews | One review per completed booking, or one per client-coach pair? | One per client-coach pair (editable, latest completed booking linked). Prevents rating-spam by frequent clients. |
-| Q9 | Data deletion vs. financial records | Deleting a client vs. keeping payment/booking history for the coach's books. | Hard-delete personal content (photos, logs, metrics, messages, profile); anonymize bookings/payments/audit rows ("Deleted client") and keep them. 7-day grace period before purge. |
-| Q10 | Memberships | What does a monthly membership grant? | `creditsPerPeriod` (N session credits per month, unused expire at period end) or unlimited (`null`) for eligible services. Billed via Stripe subscriptions; offline renewals recorded manually. |
-| Q11 | Slot granularity | Slot start interval isn't specified. | Per-coach `slotStepMin`, default 30 (options 15/30/60). |
-| Q12 | Location search | Radius/geo search or area-based? | Area/city-based filter for MVP (text + predefined city list per country); PostGIS radius search deferred. |
-| Q13 | Payment hold | How long is a slot held while paying online? | 15 minutes (`pending_payment` → `expired`). |
-| Q14 | Auth.js version | Auth.js v5 is still published under the `beta` tag. | Use v5 (pinned exact version); it's the App Router–native API. Fallback would be v4 or Better Auth — not recommended. |
-| Q15 | Group sessions & waitlists | Waitlists for full group classes? | Yes — same `WaitlistEntry` mechanism, matched by service + time. |
-| Q16 | Default currency/locale for seed | Target market looks Philippines-first (PayMongo/GCash mention). | Seed coaches: 2 × Asia/Manila PHP, 1 × America/New_York USD (to exercise DST). UI copy English. |
+| D1 | Booking states | Brief's 7 states **plus `requested`, `declined`, `expired`**. | 0001 |
+| D2 | Group classes in a block | **Mixed blocks**: an availability window can offer 1:1 and group services. The first booking claims its time range; if it's a group service, others can join until capacity (§1.3.1). | 0002 |
+| D3 | Buffers | Default **5 min before + 5 min after** every session, additive (10 min between back-to-back sessions). Coach default and per-service override stay configurable. | 0003 |
+| D4 | Cancellation window & late-cancel | Default window **30 min**, default policy **FORFEIT**: a client cancelling within 30 min of start forfeits the credit (or payment). A coach cancelling within 30 min → **no forfeiture**, full credit/refund to the client, counted in the coach's reliability stats. `FEE` = `FORFEIT` for credits. Coach can change window/policy. | 0004 |
+| D5 | Payments & payouts | **Direct-to-coach** at launch: coach lists GCash / Maya / bank details + QR Ph code. The client pays the coach directly, submits a reference no. / proof screenshot, and the coach confirms. CoachBook never holds funds; platform fee setting exists but is 0% / inactive. **Replaces the brief's "Stripe test mode default"** (Stripe doesn't onboard Philippine merchants). PayMongo online checkout is a later adapter on the same `PaymentProvider` interface. | 0005 |
+| D6 | Reviews | One review per client–coach **review period**: the assigned program's duration; else a package purchase; else a rolling 30-day window for single-session clients. Requires a completed session in that period. | 0006 |
+| D7 | Pay later | Per-coach `allowPayLater`, default **on**. Pay-later bookings are `confirmed` with an open `Charge`. | 0007 |
+| D8 | Recurring vs advance window | Recurring series ignore `maxAdvanceDays` (still respect min notice). Conflicting occurrences are **skipped and reported**. All occurrences are created up front. | 0007 |
+| D9 | Slot step | Default **60 min**, coach-adjustable (15/30/60). | 0007 |
+| D10 | Vercel deployment | Docker: worker container + SSE. Vercel: worker on a small separate host **or** Vercel Cron → `/api/cron/[job]`; realtime via the Pusher adapter. Both documented. | 0007 |
+| D11 | Data deletion | Hard-delete personal content; anonymize and keep bookings/payments/audit rows; 7-day grace period. | 0007 |
+| D12 | Memberships | `creditsPerPeriod` (N per month, unused expire at period end) or unlimited. Renewals paid direct-to-coach and confirmed by the coach (automatic billing arrives with PayMongo). | 0007 |
+| D13 | Location search | City/area filter for MVP; geo radius search deferred. | 0007 |
+| D14 | Payment hold | `pending_payment` without submitted proof expires after **15 min**. | 0007 |
+| D15 | Auth.js | v5, pinned exact version. | 0007 |
+| D16 | Waitlist | Also applies to full group classes. | 0007 |
+| D17 | Seed data | 2 × Asia/Manila PHP coaches, 1 × America/New_York USD coach (exercises DST). English UI. | 0007 |

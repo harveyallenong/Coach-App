@@ -5,7 +5,7 @@ The full design is in `docs/PLAN.md`. Read it before changing architecture or th
 
 ## Working agreement
 - Work **one phase at a time** (see `docs/PLAN.md` §6). At the end of each phase run migrate → seed → lint → typecheck → tests, update the README and `docs/demo/phase-N.md`, summarize, then **stop for review**.
-- **Never silently change a Project Decision** (brief §1 or an approved answer in PLAN §9). If something is ambiguous or conflicts, ask. Record approved decisions as ADRs in `docs/decisions/NNNN-title.md`.
+- **Never silently change a Project Decision** (brief §1 or an approved decision in PLAN §9 / `docs/decisions/`). Note ADR 0005: payments are direct-to-coach (GCash/Maya/bank + proof, coach confirms), not Stripe. If something is ambiguous or conflicts, ask. Record approved decisions as ADRs in `docs/decisions/NNNN-title.md`.
 - Prefer simple, well-tested code over clever code.
 - Every business rule (brief §4) lives in `src/server/domain/` as a pure function and has unit tests.
 
